@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use wasm_bindgen::{JsCast, JsValue, UnwrapThrowExt};
 
 use crate::preserve::PRESERVED_VALUE_MAGIC;
-use crate::{Error, ObjectExt, Result, static_str_to_js};
+use crate::{static_str_to_js, Error, ObjectExt, Result};
 
 /// Provides [`de::SeqAccess`] from any JS iterator.
 struct SeqAccess {
@@ -295,10 +295,8 @@ impl<'de> de::Deserializer<'de> for Deserializer {
                 Ok(v) => visitor.visit_i64(v),
                 Err(value) => match u64::try_from(value) {
                     Ok(v) => visitor.visit_u64(v),
-                    Err(_) => Err(de::Error::custom(
-                        "Couldn't deserialize i64 or u64 from a BigInt outside i64::MIN..u64::MAX bounds",
-                    )),
-                },
+                    Err(_) => Err(de::Error::custom("Couldn't deserialize i64 or u64 from a BigInt outside i64::MIN..u64::MAX bounds"))
+                }
             }
         } else if let Some(v) = self.value.as_f64() {
             if Number::is_safe_integer(&self.value) {

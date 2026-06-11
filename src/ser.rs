@@ -444,12 +444,7 @@ impl<'s> ser::Serializer for &'s Serializer {
             // `PreservedValueSerWrapper` stashed the value and smuggled its
             // stash slot to us as a `u32` (which we serialize as a plain JS
             // number under any configuration); pop the value right back out.
-            let slot = value.serialize(self)?;
-            let slot = slot
-                .as_f64()
-                .filter(|&f| f as u32 as f64 == f)
-                .map(|f| f as u32)
-                .ok_or_else(|| Error::custom("preserved value slot is not a valid integer"))?;
+            let slot = value.serialize(self)?.unchecked_into_f64() as u32;
             return crate::preserve::take_stashed(slot).ok_or_else(|| {
                 Error::custom("preserved value was not stashed by serde-wasm-bindgen")
             });
