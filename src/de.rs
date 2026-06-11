@@ -484,10 +484,10 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     /// but if we get a hint that they're expected, this methods allows to avoid heap allocations
     /// of an intermediate `String` by directly converting numeric codepoints instead.
     fn deserialize_char<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        if let Some(s) = self.value.dyn_ref::<JsString>()
-            && let Some(c) = s.as_char()
-        {
-            return visitor.visit_char(c);
+        if let Some(s) = self.value.dyn_ref::<JsString>() {
+            if let Some(c) = s.as_char() {
+                return visitor.visit_char(c);
+            }
         }
         self.invalid_type(visitor)
     }
