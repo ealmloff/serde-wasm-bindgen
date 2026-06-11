@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use wasm_bindgen::{JsCast, JsValue, UnwrapThrowExt};
 
 use crate::preserve::PRESERVED_VALUE_MAGIC;
-use crate::{static_str_to_js, Error, ObjectExt, Result};
+use crate::{Error, ObjectExt, Result, static_str_to_js};
 
 /// Provides [`de::SeqAccess`] from any JS iterator.
 struct SeqAccess {
@@ -295,8 +295,10 @@ impl<'de> de::Deserializer<'de> for Deserializer {
                 Ok(v) => visitor.visit_i64(v),
                 Err(value) => match u64::try_from(value) {
                     Ok(v) => visitor.visit_u64(v),
-                    Err(_) => Err(de::Error::custom("Couldn't deserialize i64 or u64 from a BigInt outside i64::MIN..u64::MAX bounds"))
-                }
+                    Err(_) => Err(de::Error::custom(
+                        "Couldn't deserialize i64 or u64 from a BigInt outside i64::MIN..u64::MAX bounds",
+                    )),
+                },
             }
         } else if let Some(v) = self.value.as_f64() {
             if Number::is_safe_integer(&self.value) {
@@ -482,10 +484,10 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     /// but if we get a hint that they're expected, this methods allows to avoid heap allocations
     /// of an intermediate `String` by directly converting numeric codepoints instead.
     fn deserialize_char<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        if let Some(s) = self.value.dyn_ref::<JsString>() {
-            if let Some(c) = s.as_char() {
-                return visitor.visit_char(c);
-            }
+        if let Some(s) = self.value.dyn_ref::<JsString>()
+            && let Some(c) = s.as_char()
+        {
+            return visitor.visit_char(c);
         }
         self.invalid_type(visitor)
     }

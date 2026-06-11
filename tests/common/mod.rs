@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::ser::Error as SerError;
 use serde::{Deserialize, Serialize};
-use serde_wasm_bindgen::{from_value, to_value, Error, Serializer};
+use serde_wasm_bindgen::{Error, Serializer, from_value, to_value};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -96,9 +96,9 @@ fn sample_js_values() -> Vec<(ValueKind, JsValue)> {
         (ValueKind::Boolean, JsValue::TRUE),
         (ValueKind::PosFloat, JsValue::from(0.5)),
         (ValueKind::NegFloat, JsValue::from(-0.5)),
-        (ValueKind::NaN, JsValue::from(std::f64::NAN)),
-        (ValueKind::PosInfinity, JsValue::from(std::f64::INFINITY)),
-        (ValueKind::NegInfinity, JsValue::from(-std::f64::INFINITY)),
+        (ValueKind::NaN, JsValue::from(f64::NAN)),
+        (ValueKind::PosInfinity, JsValue::from(f64::INFINITY)),
+        (ValueKind::NegInfinity, JsValue::from(-f64::INFINITY)),
         (ValueKind::PosInt, JsValue::from(1)),
         (ValueKind::NegInt, JsValue::from(-1)),
         (ValueKind::PosBigInt, JsValue::from(BigInt::from(1_i64))),
@@ -467,6 +467,7 @@ fn bytes() {
     let value = to_value(&serde_bytes::Bytes::new(&src)).unwrap();
     // Modify the original storage to make sure that JS value is a copy.
     src[0] = 10;
+    assert_eq!(src, [10, 2, 3]);
 
     // Make sure the JS value is a Uint8Array
     let res = value.dyn_ref::<js_sys::Uint8Array>().unwrap();
