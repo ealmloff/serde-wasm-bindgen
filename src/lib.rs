@@ -162,16 +162,6 @@ pub mod preserve {
         /// was never stashed or was already taken (a protocol violation,
         /// e.g. a value that went through a foreign serializer).
         fn take(&mut self, slot: usize) -> Option<JsValue> {
-            let value = self.free_slot(slot)?;
-            Some(value)
-        }
-
-        /// Release a slot without returning the stashed value.
-        fn discard(&mut self, slot: usize) {
-            self.free_slot(slot);
-        }
-
-        fn free_slot(&mut self, slot: usize) -> Option<JsValue> {
             let entry = self.slots.get_mut(slot)?;
             if matches!(entry, Slot::Free { .. }) {
                 return None;
@@ -195,7 +185,6 @@ pub mod preserve {
     // number regardless of configuration (`usize` goes through
     // `serialize_u64`, which becomes a `BigInt` under
     // `serialize_large_number_types_as_bigints`).
-
     pub(crate) fn stash(value: JsValue) -> u32 {
         let slot = STASH.with(|stash| stash.borrow_mut().stash(value));
         u32::try_from(slot).expect("more than u32::MAX preserved values stashed at once")
@@ -203,10 +192,6 @@ pub mod preserve {
 
     pub(crate) fn take_stashed(slot: u32) -> Option<JsValue> {
         STASH.with(|stash| stash.borrow_mut().take(slot as usize))
-    }
-
-    pub(crate) fn discard_stashed(slot: u32) {
-        STASH.with(|stash| stash.borrow_mut().discard(slot as usize));
     }
 
     struct Magic;
@@ -255,7 +240,7 @@ pub mod preserve {
         // right back out of the stash.
         let slot = stash(val.as_ref().clone());
         let result = PreservedValueSerWrapper(slot).serialize(ser);
-        discard_stashed(slot);
+        take_stashed(slot);
         result
     }
 
@@ -314,11 +299,11 @@ pub mod preserve {
 
             let slot = stash.stash(JsValue::UNDEFINED);
             assert!(stash.take(slot).is_some());
-            stash.discard(slot);
+            stash.take(slot);
 
             let reused = stash.stash(JsValue::UNDEFINED);
             assert_eq!(reused, 0);
-            stash.discard(reused);
+            stash.take(reused);
             assert!(stash.take(reused).is_none());
         }
     }
