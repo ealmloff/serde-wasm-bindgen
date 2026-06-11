@@ -102,14 +102,112 @@ pub fn to_value<T: serde::ser::Serialize + ?Sized>(value: &T) -> Result<JsValue>
 /// will return a JsValue representing an object with two fields (`int_field` and `js_field`), where
 /// `js_field` will be an `Int8Array` pointing to the same underlying JavaScript object as `s.js_field` does.
 pub mod preserve {
-    use serde::{de::Error, Deserialize, Serialize};
-    use wasm_bindgen::{
-        convert::{FromWasmAbi, IntoWasmAbi},
-        JsCast, JsValue,
-    };
+    use serde::{Deserialize, Serialize, de::Error};
+    use std::cell::RefCell;
+    use wasm_bindgen::{JsCast, JsValue};
 
     // Some arbitrary string that no one will collide with unless they try.
     pub(crate) const PRESERVED_VALUE_MAGIC: &str = "1fc430ca-5b7f-4295-92de-33cf2b145d38";
+
+    enum Slot {
+        Occupied(JsValue),
+        Free { next: Option<usize> },
+    }
+
+    /// A slab of values being passed between the `preserve` entry points
+    /// and our `Serializer`/`Deserializer` out-of-band: serde's data
+    /// model cannot carry a `JsValue`, so one side stashes the value here
+    /// and smuggles its slot through serde as a number, and the other
+    /// side takes it back out.
+    ///
+    /// In a plain round-trip the take happens immediately after the
+    /// stash, but serde adaptors that buffer and replay events may
+    /// reorder or interleave the two halves, so slots are taken by id
+    /// rather than in stack order. A foreign serializer/deserializer that
+    /// takes the MAGIC branch's place never takes its slot: the take of a
+    /// never-stashed slot fails cleanly instead of producing a wrong
+    /// value, and freed slots are reused by later preserve operations.
+    struct Stash {
+        slots: Vec<Slot>,
+        free: Option<usize>,
+    }
+
+    impl Stash {
+        const fn new() -> Self {
+            Self {
+                slots: Vec::new(),
+                free: None,
+            }
+        }
+
+        /// Stash a value for the matching [`Stash::take`] and return its
+        /// slot.
+        fn stash(&mut self, value: JsValue) -> usize {
+            if let Some(slot) = self.free {
+                let entry = &mut self.slots[slot];
+                let Slot::Free { next } = entry else {
+                    unreachable!("free list pointed at an occupied slab slot");
+                };
+                self.free = *next;
+                *entry = Slot::Occupied(value);
+                slot
+            } else {
+                let slot = self.slots.len();
+                self.slots.push(Slot::Occupied(value));
+                slot
+            }
+        }
+
+        /// Take back a [`stash`](Stash::stash)ed value; `None` if `slot`
+        /// was never stashed or was already taken (a protocol violation,
+        /// e.g. a value that went through a foreign serializer).
+        fn take(&mut self, slot: usize) -> Option<JsValue> {
+            let value = self.free_slot(slot)?;
+            Some(value)
+        }
+
+        /// Release a slot without returning the stashed value.
+        fn discard(&mut self, slot: usize) {
+            self.free_slot(slot);
+        }
+
+        fn free_slot(&mut self, slot: usize) -> Option<JsValue> {
+            let entry = self.slots.get_mut(slot)?;
+            if matches!(entry, Slot::Free { .. }) {
+                return None;
+            }
+            let old_entry = std::mem::replace(entry, Slot::Free { next: self.free });
+            let Slot::Occupied(value) = old_entry else {
+                unreachable!("checked for free slab slot before replacing it");
+            };
+
+            self.free = Some(slot);
+            Some(value)
+        }
+    }
+
+    std::thread_local! {
+        static STASH: RefCell<Stash> = const { RefCell::new(Stash::new()) };
+    }
+
+    // Slots cross the serde boundary as `u32` because `u32` is the widest
+    // integer that our `Serializer`/`Deserializer` handle as a plain JS
+    // number regardless of configuration (`usize` goes through
+    // `serialize_u64`, which becomes a `BigInt` under
+    // `serialize_large_number_types_as_bigints`).
+
+    pub(crate) fn stash(value: JsValue) -> u32 {
+        let slot = STASH.with(|stash| stash.borrow_mut().stash(value));
+        u32::try_from(slot).expect("more than u32::MAX preserved values stashed at once")
+    }
+
+    pub(crate) fn take_stashed(slot: u32) -> Option<JsValue> {
+        STASH.with(|stash| stash.borrow_mut().take(slot as usize))
+    }
+
+    pub(crate) fn discard_stashed(slot: u32) {
+        STASH.with(|stash| stash.borrow_mut().discard(slot as usize));
+    }
 
     struct Magic;
 
@@ -153,10 +251,12 @@ pub mod preserve {
     ///
     /// This function is compatible with the `serde(serialize_with)` derive annotation.
     pub fn serialize<S: serde::Serializer, T: JsCast>(val: &T, ser: S) -> Result<S::Ok, S::Error> {
-        // It's responsibility of serde-wasm-bindgen's Serializer to clone the value.
-        // For all other serializers, using reference instead of cloning here will ensure that we don't
-        // create accidental leaks.
-        PreservedValueSerWrapper(val.as_ref().into_abi()).serialize(ser)
+        // The matching MAGIC branch in our `Serializer` pops this clone
+        // right back out of the stash.
+        let slot = stash(val.as_ref().clone());
+        let result = PreservedValueSerWrapper(slot).serialize(ser);
+        discard_stashed(slot);
+        result
     }
 
     /// Deserialize any `JsCast` value.
@@ -167,21 +267,59 @@ pub mod preserve {
     /// This function is compatible with the `serde(deserialize_with)` derive annotation.
     pub fn deserialize<'de, D: serde::Deserializer<'de>, T: JsCast>(de: D) -> Result<T, D::Error> {
         let wrap = PreservedValueDeWrapper::deserialize(de)?;
-        // When used with our deserializer this unsafe is correct, because the
-        // deserializer just converted a JsValue into_abi.
-        //
-        // Other deserializers are unlikely to end up here, thanks
-        // to the asymmetry between PreservedValueSerWrapper and
-        // PreservedValueDeWrapper. Even if some other deserializer ends up
-        // here, this may be incorrect but it shouldn't be UB because JsValues
-        // are represented using indices into a JS-side (i.e. bounds-checked)
-        // array.
-        let val: JsValue = unsafe { FromWasmAbi::from_abi(wrap.1) };
+        // When used with our deserializer, the deserializer just stashed
+        // this value. Other deserializers won't have stashed anything (and
+        // are unlikely to end up here at all, thanks to the asymmetry
+        // between PreservedValueSerWrapper and PreservedValueDeWrapper),
+        // which the slot check turns into a clean error.
+        let val: JsValue = take_stashed(wrap.1).ok_or_else(|| {
+            D::Error::custom("preserved value was not stashed by serde-wasm-bindgen")
+        })?;
         val.dyn_into().map_err(|e| {
             D::Error::custom(format_args!(
                 "incompatible JS value {e:?} for type {}",
                 std::any::type_name::<T>()
             ))
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn stash_reuses_freed_slots() {
+            let mut stash = Stash::new();
+
+            let first = stash.stash(JsValue::UNDEFINED);
+            let second = stash.stash(JsValue::UNDEFINED);
+            assert_eq!(first, 0);
+            assert_eq!(second, 1);
+
+            assert!(stash.take(first).is_some());
+            let reused = stash.stash(JsValue::UNDEFINED);
+            assert_eq!(reused, first);
+
+            assert!(stash.take(second).is_some());
+            assert!(stash.take(reused).is_some());
+
+            let after_clear = stash.stash(JsValue::UNDEFINED);
+            assert_eq!(after_clear, reused);
+            assert!(stash.take(after_clear).is_some());
+        }
+
+        #[test]
+        fn discard_is_idempotent() {
+            let mut stash = Stash::new();
+
+            let slot = stash.stash(JsValue::UNDEFINED);
+            assert!(stash.take(slot).is_some());
+            stash.discard(slot);
+
+            let reused = stash.stash(JsValue::UNDEFINED);
+            assert_eq!(reused, 0);
+            stash.discard(reused);
+            assert!(stash.take(reused).is_none());
+        }
     }
 }

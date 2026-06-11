@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::ser::Error as SerError;
 use serde::{Deserialize, Serialize};
-use serde_wasm_bindgen::{from_value, to_value, Error, Serializer};
+use serde_wasm_bindgen::{Error, Serializer, from_value, to_value};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -96,9 +96,9 @@ fn sample_js_values() -> Vec<(ValueKind, JsValue)> {
         (ValueKind::Boolean, JsValue::TRUE),
         (ValueKind::PosFloat, JsValue::from(0.5)),
         (ValueKind::NegFloat, JsValue::from(-0.5)),
-        (ValueKind::NaN, JsValue::from(std::f64::NAN)),
-        (ValueKind::PosInfinity, JsValue::from(std::f64::INFINITY)),
-        (ValueKind::NegInfinity, JsValue::from(-std::f64::INFINITY)),
+        (ValueKind::NaN, JsValue::from(f64::NAN)),
+        (ValueKind::PosInfinity, JsValue::from(f64::INFINITY)),
+        (ValueKind::NegInfinity, JsValue::from(-f64::INFINITY)),
         (ValueKind::PosInt, JsValue::from(1)),
         (ValueKind::NegInt, JsValue::from(-1)),
         (ValueKind::PosBigInt, JsValue::from(BigInt::from(1_i64))),
@@ -467,6 +467,7 @@ fn bytes() {
     let value = to_value(&serde_bytes::Bytes::new(&src)).unwrap();
     // Modify the original storage to make sure that JS value is a copy.
     src[0] = 10;
+    assert_ne!(src, orig_src);
 
     // Make sure the JS value is a Uint8Array
     let res = value.dyn_ref::<js_sys::Uint8Array>().unwrap();
@@ -910,4 +911,106 @@ fn field_aliases() {
     }
 
     test_via_round_trip_with_config(Struct { a: 42, c: 84 }, &SERIALIZER);
+}
+
+/// The `preserve` smuggling protocol assumes its two halves run back to
+/// back. serde machinery that buffers and replays values (`flatten` on
+/// deserialization, untagged enums) breaks that pairing; these tests pin
+/// the resulting behavior: serialization through `flatten` works (no
+/// buffering on the serialize side), while the buffered deserialization
+/// paths fail with a clean error rather than producing a wrong value.
+#[wasm_bindgen_test]
+fn preserved_value_protocol_edges() {
+    #[derive(Serialize, Deserialize, Debug)]
+    struct Inner {
+        #[serde(with = "serde_wasm_bindgen::preserve")]
+        a: JsValue,
+        n: u32,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    struct InnerB {
+        #[serde(with = "serde_wasm_bindgen::preserve")]
+        b: JsValue,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    struct Outer {
+        #[serde(flatten)]
+        i1: Inner,
+        #[serde(flatten)]
+        i2: InnerB,
+        #[serde(with = "serde_wasm_bindgen::preserve")]
+        c: JsValue,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    #[serde(untagged)]
+    enum Un {
+        WithPreserve {
+            #[serde(with = "serde_wasm_bindgen::preserve")]
+            x: JsValue,
+            tag: u32,
+        },
+        Other {
+            y: String,
+        },
+    }
+
+    let marker_a: JsValue = js_sys::Symbol::for_("A").into();
+    let marker_b: JsValue = js_sys::Symbol::for_("B").into();
+    let marker_c: JsValue = js_sys::Symbol::for_("C").into();
+
+    // Serializing through `flatten` forwards directly (no buffering), so
+    // preserved values pass through by identity — even several of them.
+    // `flatten` makes serde treat the struct as a map, which serializes
+    // to an ES `Map` under the default config.
+    let out = to_value(&Outer {
+        i1: Inner {
+            a: marker_a.clone(),
+            n: 7,
+        },
+        i2: InnerB {
+            b: marker_b.clone(),
+        },
+        c: marker_c.clone(),
+    })
+    .unwrap();
+    let map = out.dyn_into::<js_sys::Map>().unwrap();
+    assert_eq!(map.get(&"a".into()), marker_a);
+    assert_eq!(map.get(&"n".into()), JsValue::from_f64(7.0));
+    assert_eq!(map.get(&"b".into()), marker_b);
+    assert_eq!(map.get(&"c".into()), marker_c);
+
+    // Deserializing through `flatten` buffers values into serde's
+    // internal `Content`, which never reaches the smuggling protocol:
+    // clean error, not a wrong value.
+    from_value::<Outer>(map.into()).unwrap_err();
+
+    // Same for a preserved field inside an untagged enum variant...
+    let obj = Object::new();
+    js_sys::Reflect::set(&obj, &"x".into(), &marker_a).unwrap();
+    js_sys::Reflect::set(&obj, &"tag".into(), &1.into()).unwrap();
+    from_value::<Un>(obj.into()).unwrap_err();
+
+    // ...while other variants of the same enum still deserialize.
+    let obj = Object::new();
+    js_sys::Reflect::set(&obj, &"y".into(), &"hello".into()).unwrap();
+    match from_value::<Un>(obj.into()).unwrap() {
+        Un::Other { y } => assert_eq!(y, "hello"),
+        other => panic!("expected Un::Other, got {other:?}"),
+    }
+
+    // A foreign serializer can serialize the magic wrapper (the smuggled
+    // number ends up in its output, meaningless outside this crate), and
+    // native round-trips keep working afterwards.
+    serde_json::to_string(&InnerB {
+        b: marker_b.clone(),
+    })
+    .unwrap();
+    let out = to_value(&InnerB {
+        b: marker_c.clone(),
+    })
+    .unwrap();
+    assert_eq!(js_sys::Reflect::get(&out, &"b".into()).unwrap(), marker_c);
 }
